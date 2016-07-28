@@ -44,7 +44,7 @@ test:
 	py.test -v tests/unit/ tests/functional/
 
 typecheck:
-	mypy --py2 --silent-import -p chalice
+	mypy --py2 --silent-import -p chalice --disallow-untyped-defs
 
 coverage:
 	py.test --cov chalice --cov-report term-missing tests/

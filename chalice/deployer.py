@@ -184,6 +184,7 @@ def node(name, uri_path, is_route=False):
 class NoPrompt(object):
 
     def confirm(self, text, default=False, abort=False):
+        # type: (str, Optional[bool], Optional[bool]) -> bool
         return default
 
 
@@ -351,12 +352,12 @@ class Deployer(object):
         previous = self._load_last_policy(config)
         diff = policy.diff_policies(previous, app_policy)
         if diff:
-            if diff.get('added', []):
+            if diff.get('added', set()):
                 print ("\nThe following actions will be added to "
                        "the execution policy:\n")
                 for action in diff['added']:
                     print action
-            if diff.get('removed', []):
+            if diff.get('removed', set()):
                 print ("\nThe following action will be removed from "
                        "the execution policy:\n")
                 for action in diff['removed']:
@@ -372,6 +373,7 @@ class Deployer(object):
         self._record_policy(config, app_policy)
 
     def _get_policy_from_source_code(self, config):
+        # type: (Dict[str, Any]) -> Dict[str, Any]
         if config['autogen_policy']:
             app_py = os.path.join(config['project_dir'], 'app.py')
             assert os.path.isfile(app_py)
@@ -404,6 +406,7 @@ class Deployer(object):
         return role_arn
 
     def _load_last_policy(self, config):
+        # type: (Dict[str, Any]) -> Dict[str, Any]
         policy_file = os.path.join(config['project_dir'],
                                    '.chalice', 'policy.json')
         if not os.path.isfile(policy_file):
@@ -412,6 +415,7 @@ class Deployer(object):
             return json.loads(f.read())
 
     def _record_policy(self, config, policy):
+        # type: (Dict[str, Any], Dict[str, Any]) -> None
         policy_file = os.path.join(config['project_dir'],
                                    '.chalice', 'policy.json')
         with open(policy_file, 'w') as f:
@@ -530,13 +534,13 @@ class APIGatewayResourceCreator(object):
         self._random_id = random_id_generator
 
     def build_resources(self, chalice_trie):
+        # type: (Dict[str, Any]) -> None
         """Create API gateway resources from chalice routes.
 
         :type chalice_trie: dict
         :param chalice_trie: The trie of URLs from ``build_url_trie()``.
 
         """
-        # type: Dict[str, Any] -> None
         # We need to create the parent resource before we can create
         # child resources, so we'll do a pre-order depth first traversal.
         stack = [chalice_trie]
@@ -648,10 +652,8 @@ class APIGatewayResourceCreator(object):
 
 class LambdaDeploymentPackager(object):
 
-    def __init__(self):
-        pass
-
     def _verify_has_virtualenv(self):
+        # type: (None) -> None
         try:
             subprocess.check_output(['virtualenv', '--version'])
         except (subprocess.CalledProcessError, OSError):
@@ -806,6 +808,7 @@ class LambdaDeploymentPackager(object):
 class ResourceQuery(object):
 
     def __init__(self, lambda_client, apigateway_client):
+        # type: (Any, Any) -> None
         self._lambda_client = lambda_client
         self._apigateway_client = apigateway_client
 
