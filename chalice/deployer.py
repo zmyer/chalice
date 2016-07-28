@@ -192,8 +192,12 @@ class Deployer(object):
     LAMBDA_CREATE_ATTEMPTS = 5
     DELAY_TIME = 3
 
-    def __init__(self, session=None, prompter=None, profile=None):
-        # type: (botocore.session.Session) -> None
+    def __init__(self,
+                 session=None,   # type: Optional[botocore.session.Session]
+                 prompter=None,  # type: Any
+                 profile=None,   # type: Optional[str]
+                 ):
+        # type: (...) -> None
         if session is None:
             if profile:
                 session = botocore.session.Session(profile=profile)
