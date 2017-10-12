@@ -7,7 +7,7 @@ from pytest import fixture
 import mock
 import botocore.session
 
-from chalice.awsclient import TypedAWSClient, ResourceDoesNotExistError
+from chalice.awsclient import TypedAWSClient
 from chalice.utils import OSUtils
 from chalice.deploy import models
 from chalice.deploy import packager
@@ -21,9 +21,10 @@ from chalice.deploy.newdeployer import DependencyBuilder
 from chalice.deploy.newdeployer import ApplicationGraphBuilder
 from chalice.deploy.newdeployer import InjectDefaults, DeploymentPackager
 from chalice.deploy.newdeployer import PolicyGenerator
-from chalice.deploy.newdeployer import PlanStage, APICall
-from chalice.deploy.newdeployer import Executor, Variable
+from chalice.deploy.planner import PlanStage, Variable
+from chalice.deploy.newdeployer import Executor
 from chalice.deploy.newdeployer import UnresolvedValueError
+from chalice.deploy.models import APICall
 from chalice.policy import AppPolicyGenerator
 from chalice.constants import LAMBDA_TRUST_POLICY
 
@@ -34,7 +35,9 @@ class FooResource(models.Model):
     leaf = attrib()
 
     def dependencies(self):
-        return [self.leaf]
+        if not isinstance(self.leaf, list):
+            return [self.leaf]
+        return self.leaf
 
 
 @attrs
@@ -78,25 +81,58 @@ def create_function_resource(name):
     )
 
 
-def test_can_build_resource_with_single_dep():
-    role = models.PreCreatedIAMRole(role_arn='foo')
-    app = models.Application(stage='dev', resources=[role])
+class TestDependencyBuilder(object):
+    def test_can_build_resource_with_single_dep(self):
+        role = models.PreCreatedIAMRole(role_arn='foo')
+        app = models.Application(stage='dev', resources=[role])
 
-    dep_builder = DependencyBuilder()
-    deps = dep_builder.build_dependencies(app)
-    assert deps == [role]
+        dep_builder = DependencyBuilder()
+        deps = dep_builder.build_dependencies(app)
+        assert deps == [role]
 
+    def test_can_build_resource_with_dag_deps(self):
+        shared_leaf = LeafResource(name='leaf-resource')
+        first_parent = FooResource(name='first', leaf=shared_leaf)
+        second_parent = FooResource(name='second', leaf=shared_leaf)
+        app = models.Application(
+            stage='dev', resources=[first_parent, second_parent])
 
-def test_can_build_resource_with_dag_deps():
-    shared_leaf = LeafResource(name='leaf-resource')
-    first_parent = FooResource(name='first', leaf=shared_leaf)
-    second_parent = FooResource(name='second', leaf=shared_leaf)
-    app = models.Application(
-        stage='dev', resources=[first_parent, second_parent])
+        dep_builder = DependencyBuilder()
+        deps = dep_builder.build_dependencies(app)
+        assert deps == [shared_leaf, first_parent, second_parent]
 
-    dep_builder = DependencyBuilder()
-    deps = dep_builder.build_dependencies(app)
-    assert deps == [shared_leaf, first_parent, second_parent]
+    def test_is_first_element_in_list(self):
+        shared_leaf = LeafResource(name='leaf-resource')
+        first_parent = FooResource(name='first', leaf=shared_leaf)
+        app = models.Application(
+            stage='dev', resources=[first_parent, shared_leaf],
+        )
+        dep_builder = DependencyBuilder()
+        deps = dep_builder.build_dependencies(app)
+        assert deps == [shared_leaf, first_parent]
+
+    def test_can_compares_with_identity_not_equality(self):
+        first_leaf = LeafResource(name='same-name')
+        second_leaf = LeafResource(name='same-name')
+        first_parent = FooResource(name='first', leaf=first_leaf)
+        second_parent = FooResource(name='second', leaf=second_leaf)
+        app = models.Application(
+            stage='dev', resources=[first_parent, second_parent])
+
+        dep_builder = DependencyBuilder()
+        deps = dep_builder.build_dependencies(app)
+        assert deps == [first_leaf, first_parent, second_leaf, second_parent]
+
+    def test_no_duplicate_depedencies(self):
+        leaf = LeafResource(name='leaf')
+        second_parent = FooResource(name='second', leaf=leaf)
+        first_parent = FooResource(name='first', leaf=[leaf, second_parent])
+        app = models.Application(
+            stage='dev', resources=[first_parent])
+
+        dep_builder = DependencyBuilder()
+        deps = dep_builder.build_dependencies(app)
+        assert deps == [leaf, second_parent, first_parent]
 
 
 class TestApplicationGraphBuilder(object):
@@ -160,6 +196,8 @@ class TestApplicationGraphBuilder(object):
         assert len(application.resources) == 2
         # The lambda functions by default share the same role
         assert application.resources[0].role == application.resources[1].role
+        # Not just in equality but the exact same role objects.
+        assert application.resources[0].role is application.resources[1].role
         # And all lambda functions share the same deployment package.
         assert (application.resources[0].deployment_package ==
                 application.resources[1].deployment_package)
@@ -223,17 +261,28 @@ class RoleTestCase(object):
         resources = application.resources
         assert len(resources) == len(self.given)
         functions_by_name = {f.function_name: f for f in resources}
+        # Roles that have the same name/arn should be the same
+        # object.  If we encounter a role that's already in
+        # roles_by_identifier, we'll verify that it's the exact same object.
+        roles_by_identifier = {}
         for function_name, expected in self.roles.items():
             full_name = 'appname-dev-%s' % function_name
             assert full_name in functions_by_name
             actual_role = functions_by_name[full_name].role
             expectations = self.roles[function_name]
             if not expectations.get('managed_role', True):
+                actual_role_arn = actual_role.role_arn
                 assert isinstance(actual_role, models.PreCreatedIAMRole)
-                assert expectations['iam_role_arn'] == actual_role.role_arn
+                assert expectations['iam_role_arn'] == actual_role_arn
+                if actual_role_arn in roles_by_identifier:
+                    assert roles_by_identifier[actual_role_arn] is actual_role
+                roles_by_identifier[actual_role_arn] = actual_role
                 continue
-            assert expectations['name'] == actual_role.role_name
-
+            actual_name = actual_role.role_name
+            assert expectations['name'] == actual_name
+            if actual_name in roles_by_identifier:
+                assert roles_by_identifier[actual_name] is actual_role
+            roles_by_identifier[actual_name] = actual_role
             is_autogenerated = expectations.get('autogenerated', False)
             policy_file = expectations.get('policy_file')
             if is_autogenerated:
@@ -323,6 +372,13 @@ ROLE_TEST_CASES = [
         # 'managed_role' will verify the associated role is a
         # models.PreCreatedIAMRoleType with the provided iam_role_arn.
         roles={'a': {'managed_role': False, 'iam_role_arn': 'role:arn'}}),
+    # Verify that we can use the same non-managed role for multiple
+    # lambda functions.
+    RoleTestCase(
+        given={'a': {'manage_iam_role': False, 'iam_role_arn': 'role:arn'},
+               'b': {'manage_iam_role': False, 'iam_role_arn': 'role:arn'}},
+        roles={'a': {'managed_role': False, 'iam_role_arn': 'role:arn'},
+               'b': {'managed_role': False, 'iam_role_arn': 'role:arn'}}),
     RoleTestCase(
         given={'a': {'manage_iam_role': False, 'iam_role_arn': 'role:arn'},
                'b': {'autogen_policy': True}},
@@ -481,97 +537,6 @@ class TestDeploymentPackager(object):
         assert not generator.create_deployment_package.called
 
 
-class TestPlanStage(object):
-    def test_can_plan_for_iam_role_creation(self, mock_client, mock_osutils):
-        mock_client.get_role_arn_for_name.side_effect = \
-            ResourceDoesNotExistError()
-        planner = PlanStage(mock_client, mock_osutils)
-        resource = models.ManagedIAMRole(
-            resource_name='default-role',
-            role_arn=models.Placeholder.DEPLOY_STAGE,
-            role_name='myrole',
-            trust_policy={'trust': 'policy'},
-            policy=models.AutoGenIAMPolicy(document={'iam': 'policy'}),
-        )
-        plan = planner.execute(Config.create(), [resource])
-        assert len(plan) == 1
-        api_call = plan[0]
-        assert api_call.method_name == 'create_role'
-        assert api_call.params == {'name': 'myrole',
-                                   'trust_policy': {'trust': 'policy'},
-                                   'policy': {'iam': 'policy'}}
-        assert api_call.target_variable == 'myrole_role_arn'
-        assert api_call.resource == resource
-
-    def test_no_action_if_role_exists(self, mock_client, mock_osutils):
-        # This might need some tweaking to figure out if we need
-        # to update the policy or not.
-        mock_client.get_role_arn_for_name.return_value = 'role:arn'
-        planner = PlanStage(mock_client, mock_osutils)
-        resource = models.ManagedIAMRole(
-            resource_name='default-role',
-            role_arn=models.Placeholder.DEPLOY_STAGE,
-            role_name='myrole',
-            trust_policy={'trust': 'policy'},
-            policy=models.AutoGenIAMPolicy(document={'iam': 'policy'}),
-        )
-        plan = planner.execute(Config.create(), [resource])
-        assert plan == []
-
-    def test_can_create_function(self, mock_client, mock_osutils):
-        mock_client.lambda_function_exists.return_value = False
-        function = create_function_resource('function_name')
-        planner = PlanStage(mock_client, mock_osutils)
-        plan = planner.execute(Config.create(), [function])
-        assert len(plan) == 1
-        call = plan[0]
-        assert call.method_name == 'create_function'
-        assert call.target_variable == 'function_name_lambda_arn'
-        assert call.params == {
-            'function_name': 'appname-dev-function_name',
-            'role_arn': 'role:arn',
-            'zip_contents': mock.ANY,
-            'runtime': 'python2.7',
-            'handler': 'app.app',
-            'environment_variables': {},
-            'tags': {},
-            'timeout': 60,
-            'memory_size': 128,
-        }
-        assert call.resource == function
-
-    def test_no_plan_if_function_exists(self, mock_client, mock_osutils):
-        mock_client.lambda_function_exists.return_value = True
-        function = create_function_resource('function_name')
-        planner = PlanStage(mock_client, mock_osutils)
-        plan = planner.execute(Config.create(), [function])
-        # This will change once updates are implemented.
-        assert plan == []
-
-    def test_can_create_plan_for_managed_role(self, mock_client, mock_osutils):
-        mock_client.lambda_function_exists.return_value = False
-        function = create_function_resource('function_name')
-        function.role = models.ManagedIAMRole(
-            resource_name='myrole',
-            role_arn=models.Placeholder.DEPLOY_STAGE,
-            role_name='myrole-dev',
-            trust_policy={'trust': 'policy'},
-            policy=models.FileBasedIAMPolicy(filename='foo.json'),
-        )
-        planner = PlanStage(mock_client, mock_osutils)
-        plan = planner.execute(Config.create(), [function])
-        assert len(plan) == 1
-        call = plan[0]
-        assert call.method_name == 'create_function'
-        assert call.target_variable == 'function_name_lambda_arn'
-        assert call.resource == function
-        # The params are verified in test_can_create_function,
-        # we just care about how the role_arn Variable is constructed.
-        role_arn = call.params['role_arn']
-        assert isinstance(role_arn, Variable)
-        assert role_arn.name == 'myrole-dev_role_arn'
-
-
 class TestInvoker(object):
     def test_can_invoke_api_call_with_no_output(self, mock_client):
         params = {'name': 'foo', 'trust_policy': {'trust': 'policy'},
@@ -698,7 +663,7 @@ class TestDeployer(unittest.TestCase):
         self.resource_builder.build.assert_called_with(config, 'dev')
         self.deps_builder.build_dependencies.assert_called_with(app)
         self.build_stage.execute.assert_called_with(config, resources)
-        self.plan_stage.execute.assert_called_with(config, resources)
+        self.plan_stage.execute.assert_called_with(resources)
         self.executor.execute.assert_called_with(api_calls)
 
         assert result == {'resources': {'foo': {'name': 'bar'}}}

@@ -83,7 +83,7 @@ is used as the key in the ``deployed.json`` dictionary.
 """
 import os
 
-from typing import List, Set, Dict, Any, Optional, Union  # noqa
+from typing import List, Set, Dict, Any, Optional, Union, cast  # noqa
 from botocore.session import Session  # noqa
 
 from chalice.utils import OSUtils, UI
@@ -93,11 +93,12 @@ from chalice import app  # noqa
 from chalice.deploy.packager import LambdaDeploymentPackager
 from chalice.deploy.packager import PipRunner, SubprocessPip
 from chalice.deploy.packager import DependencyBuilder as PipDependencyBuilder
+from chalice.deploy.planner import PlanStage, Variable, RemoteState
 from chalice.policy import AppPolicyGenerator
 from chalice.constants import LAMBDA_TRUST_POLICY
 from chalice.constants import DEFAULT_LAMBDA_TIMEOUT
 from chalice.constants import DEFAULT_LAMBDA_MEMORY_SIZE
-from chalice.awsclient import TypedAWSClient, ResourceDoesNotExistError
+from chalice.awsclient import TypedAWSClient
 
 
 def create_default_deployer(session):
@@ -131,7 +132,7 @@ def create_default_deployer(session):
             ],
         ),
         plan_stage=PlanStage(
-            client=client, osutils=osutils,
+            osutils=osutils, remote_state=RemoteState(client),
         ),
         executor=Executor(client),
     )
@@ -173,7 +174,7 @@ class Deployer(object):
             config, chalice_stage_name)
         resources = self._deps_builder.build_dependencies(application)
         self._build_stage.execute(config, resources)
-        plan = self._plan_stage.execute(config, resources)
+        plan = self._plan_stage.execute(resources)
         self._executor.execute(plan)
         return {'resources': self._executor.resources}
 
@@ -181,7 +182,7 @@ class Deployer(object):
 class ApplicationGraphBuilder(object):
     def __init__(self):
         # type: () -> None
-        pass
+        self._known_roles = {}  # type: Dict[str, models.IAMRole]
 
     def build(self, config, stage_name):
         # type: (Config, str) -> models.Application
@@ -197,6 +198,27 @@ class ApplicationGraphBuilder(object):
         return models.Application(stage_name, resources)
 
     def _get_role_reference(self, config, stage_name, function):
+        # type: (Config, str, app.LambdaFunction) -> models.IAMRole
+        role = self._create_role_reference(config, stage_name, function)
+        role_identifier = self._get_role_identifier(role)
+        if role_identifier in self._known_roles:
+            # If we've already create a models.IAMRole with the same
+            # identifier, we'll use the existing object instead of
+            # creating a new one.
+            return self._known_roles[role_identifier]
+        self._known_roles[role_identifier] = role
+        return role
+
+    def _get_role_identifier(self, role):
+        # type: (models.IAMRole) -> str
+        if isinstance(role, models.PreCreatedIAMRole):
+            return role.role_arn
+        # We know that if it's not a PreCreatedIAMRole, it's
+        # a managed role, so we're using cast() to make mypy happy.
+        role = cast(models.ManagedIAMRole, role)
+        return role.resource_name
+
+    def _create_role_reference(self, config, stage_name, function):
         # type: (Config, str, app.LambdaFunction) -> models.IAMRole
         # First option, the user doesn't want us to manage
         # the role at all.
@@ -275,7 +297,10 @@ class DependencyBuilder(object):
             if id(dep) not in seen:
                 seen.add(id(dep))
                 self._traverse(dep, ordered, seen)
-        if resource not in ordered:
+        # If recreating this list is a perf issue later on,
+        # we can create yet-another set of ids that gets updated
+        # when we add a resource to the ordered list.
+        if id(resource) not in [id(r) for r in ordered]:
             ordered.append(resource)
 
 
@@ -341,98 +366,6 @@ class BuildStage(object):
                 step.handle(config, resource)
 
 
-class PlanStage(object):
-    def __init__(self, client, osutils):
-        # type: (TypedAWSClient, OSUtils) -> None
-        self._client = client
-        self._osutils = osutils
-
-    def execute(self, config, resources):
-        # type: (Config, List[models.Model]) -> List[APICall]
-        plan = []
-        for resource in resources:
-            name = 'plan_%s' % resource.__class__.__name__.lower()
-            handler = getattr(self, name, None)
-            if handler is not None:
-                result = handler(config, resource)
-                if result is not None:
-                    plan.append(result)
-        return plan
-
-    def plan_lambdafunction(self, config, resource):
-        # type: (Config, models.LambdaFunction) -> Optional[APICall]
-        if self._client.lambda_function_exists(resource.function_name):
-            return None
-        role_arn = ''  # type: Union[str, Variable]
-        if isinstance(resource.role, models.PreCreatedIAMRole):
-            role_arn = resource.role.role_arn
-        elif isinstance(resource.role, models.ManagedIAMRole) and \
-                isinstance(resource.role.role_arn, models.Placeholder):
-            role_arn = Variable('%s_role_arn' % resource.role.role_name)
-        return APICall(
-            method_name='create_function',
-            params={'function_name': resource.function_name,
-                    'role_arn': role_arn,
-                    'zip_contents': self._osutils.get_file_contents(
-                        resource.deployment_package.filename, binary=True),
-                    'runtime': resource.runtime,
-                    'handler': resource.handler,
-                    'environment_variables': resource.environment_variables,
-                    'tags': resource.tags,
-                    'timeout': resource.timeout,
-                    'memory_size': resource.memory_size},
-            target_variable='%s_lambda_arn' % resource.resource_name,
-            resource=resource,
-        )
-
-    def plan_managediamrole(self, config, resource):
-        # type: (Config, models.ManagedIAMRole) -> Optional[APICall]
-        if isinstance(resource.role_arn, models.Placeholder):
-            try:
-                role_arn = self._client.get_role_arn_for_name(
-                    resource.role_name)
-                resource.role_arn = role_arn
-            except ResourceDoesNotExistError:
-                document = None
-                if isinstance(resource.policy, models.AutoGenIAMPolicy):
-                    document = resource.policy.document
-                return APICall(
-                    method_name='create_role',
-                    params={'name': resource.role_name,
-                            'trust_policy': resource.trust_policy,
-                            'policy': document},
-                    target_variable='%s_role_arn' % resource.role_name,
-                    resource=resource)
-        # This is to make mypy happy, otherwise it complains
-        # about a missing return statement.
-        return None
-
-
-class APICall(object):
-    def __init__(self,
-                 method_name,           # type: str
-                 params,                # type: Dict[str, Any]
-                 target_variable=None,  # type: Optional[str]
-                 resource=None,         # type: Optional[models.ManagedModel]
-                 ):
-        # type: (...) -> None
-        self.method_name = method_name
-        self.params = params
-        self.target_variable = target_variable
-        self.resource = resource
-
-    def __repr__(self):
-        # type: () -> str
-        return '%s(%s, %s)' % (self.__class__.__name__,
-                               self.method_name, self.params)
-
-
-class Variable(object):
-    def __init__(self, name):
-        # type: (str) -> None
-        self.name = name
-
-
 class Executor(object):
     def __init__(self, client):
         # type: (TypedAWSClient) -> None
@@ -443,7 +376,7 @@ class Executor(object):
         self.resources = {}  # type: Dict[str, Dict[str, Any]]
 
     def execute(self, api_calls):
-        # type: (List[APICall]) -> None
+        # type: (List[models.APICall]) -> None
         for api_call in api_calls:
             final_kwargs = self._resolve_variables(api_call)
             method = getattr(self._client, api_call.method_name)
@@ -461,7 +394,7 @@ class Executor(object):
                     mapping[varname] = result
 
     def _resolve_variables(self, api_call):
-        # type: (APICall) -> Dict[str, Any]
+        # type: (models.APICall) -> Dict[str, Any]
         final = {}
         for key, value in api_call.params.items():
             if isinstance(value, Variable):
