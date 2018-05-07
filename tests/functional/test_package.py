@@ -1,9 +1,12 @@
 import os
 import zipfile
-import mock
-from collections import defaultdict
+import tarfile
+import io
+from collections import defaultdict, namedtuple
 
 import pytest
+import mock
+
 from chalice.config import Config
 from chalice import Chalice
 from chalice import package
@@ -11,12 +14,16 @@ from chalice.deploy.packager import PipRunner
 from chalice.deploy.packager import DependencyBuilder
 from chalice.deploy.packager import Package
 from chalice.deploy.packager import MissingDependencyError
+from chalice.deploy.packager import SubprocessPip
+from chalice.deploy.packager import SDistMetadataFetcher
+from chalice.deploy.packager import InvalidSourceDistributionNameError
 from chalice.compat import lambda_abi
 from chalice.compat import pip_no_compile_c_env_vars
 from chalice.compat import pip_no_compile_c_shim
 from chalice.utils import OSUtils
-from tests.conftest import FakeSdistBuilder
-from tests.conftest import FakePipCall
+
+
+FakePipCall = namedtuple('FakePipEntry', ['args', 'env_vars', 'shim'])
 
 
 def _create_app_structure(tmpdir):
@@ -34,6 +41,35 @@ def sample_app():
         return {"hello": "world"}
 
     return app
+
+
+@pytest.fixture
+def sdist_reader():
+    return SDistMetadataFetcher()
+
+
+@pytest.fixture
+def sdist_builder():
+    s = FakeSdistBuilder()
+    return s
+
+
+class FakeSdistBuilder(object):
+    _SETUP_PY = (
+        'from setuptools import setup\n'
+        'setup(\n'
+        '    name="%s",\n'
+        '    version="%s"\n'
+        ')\n'
+    )
+
+    def write_fake_sdist(self, directory, name, version):
+        filename = '%s-%s.zip' % (name, version)
+        path = '%s/%s' % (directory, filename)
+        with zipfile.ZipFile(path, 'w',
+                             compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr('sdist/setup.py', self._SETUP_PY % (name, version))
+        return directory, filename
 
 
 class PathArgumentEndingWith(object):
@@ -201,6 +237,30 @@ class TestDependencyBuilder(object):
             packages=[
                 'foo-1.2-cp36-cp36m-manylinux1_x86_64.whl',
                 'bar-1.2-cp36-cp36m-manylinux1_x86_64.whl'
+            ]
+        )
+
+        site_packages = os.path.join(appdir, '.chalice.', 'site-packages')
+        builder.build_site_packages(requirements_file, site_packages)
+        installed_packages = os.listdir(site_packages)
+
+        pip.validate()
+        for req in reqs:
+            assert req in installed_packages
+
+    def test_can_use_abi3_whl_for_any_python3(self, tmpdir, pip_runner):
+        reqs = ['foo', 'bar', 'baz', 'qux']
+        pip, runner = pip_runner
+        appdir, builder = self._make_appdir_and_dependency_builder(
+            reqs, tmpdir, runner)
+        requirements_file = os.path.join(appdir, 'requirements.txt')
+        pip.packages_to_download(
+            expected_args=['-r', requirements_file, '--dest', mock.ANY],
+            packages=[
+                'foo-1.2-cp33-abi3-manylinux1_x86_64.whl',
+                'bar-1.2-cp34-abi3-manylinux1_x86_64.whl',
+                'baz-1.2-cp35-abi3-manylinux1_x86_64.whl',
+                'qux-1.2-cp36-abi3-manylinux1_x86_64.whl',
             ]
         )
 
@@ -525,6 +585,36 @@ class TestDependencyBuilder(object):
         for req in reqs:
             assert req in installed_packages
 
+    def test_whitelist_sqlalchemy(self, tmpdir, osutils, pip_runner):
+        reqs = ['sqlalchemy==1.1.18']
+        pip, runner = pip_runner
+        appdir, builder = self._make_appdir_and_dependency_builder(
+            reqs, tmpdir, runner)
+        requirements_file = os.path.join(appdir, 'requirements.txt')
+        pip.packages_to_download(
+            expected_args=['-r', requirements_file, '--dest', mock.ANY],
+            packages=[
+                'SQLAlchemy-1.1.18-cp36-cp36m-macosx_10_11_x86_64.whl'
+            ]
+        )
+        pip.packages_to_download(
+            expected_args=[
+                '--only-binary=:all:', '--no-deps', '--platform',
+                'manylinux1_x86_64', '--implementation', 'cp',
+                '--abi', lambda_abi, '--dest', mock.ANY,
+                'sqlalchemy==1.1.18'
+            ],
+            packages=[
+                'SQLAlchemy-1.1.18-cp36-cp36m-macosx_10_11_x86_64.whl'
+            ]
+        )
+        site_packages = os.path.join(appdir, '.chalice.', 'site-packages')
+        builder.build_site_packages(requirements_file, site_packages)
+        installed_packages = os.listdir(site_packages)
+
+        pip.validate()
+        assert installed_packages == ['SQLAlchemy']
+
     def test_can_build_sdist(self, tmpdir, osutils, pip_runner):
         reqs = ['foo', 'bar']
         pip, runner = pip_runner
@@ -696,10 +786,12 @@ def test_can_create_app_packager_with_no_autogen(tmpdir):
     appdir = _create_app_structure(tmpdir)
 
     outdir = tmpdir.mkdir('outdir')
+    default_params = {'autogen_policy': True}
     config = Config.create(project_dir=str(appdir),
-                           chalice_app=sample_app())
+                           chalice_app=sample_app(),
+                           **default_params)
     p = package.create_app_packager(config)
-    p.package_app(config, str(outdir))
+    p.package_app(config, str(outdir), 'dev')
     # We're not concerned with the contents of the files
     # (those are tested in the unit tests), we just want to make
     # sure they're written to disk and look (mostly) right.
@@ -711,10 +803,223 @@ def test_can_create_app_packager_with_no_autogen(tmpdir):
 def test_will_create_outdir_if_needed(tmpdir):
     appdir = _create_app_structure(tmpdir)
     outdir = str(appdir.join('outdir'))
+    default_params = {'autogen_policy': True}
     config = Config.create(project_dir=str(appdir),
-                           chalice_app=sample_app())
+                           chalice_app=sample_app(),
+                           **default_params)
     p = package.create_app_packager(config)
-    p.package_app(config, str(outdir))
+    p.package_app(config, str(outdir), 'dev')
     contents = os.listdir(str(outdir))
     assert 'deployment.zip' in contents
     assert 'sam.json' in contents
+
+
+class TestSubprocessPip(object):
+    def test_can_invoke_pip(self):
+        pip = SubprocessPip()
+        rc, err = pip.main(['--version'])
+        # Simple assertion that we can execute pip and it gives us some output
+        # and nothing on stderr.
+        assert rc == 0
+        assert err == b''
+
+    def test_does_error_code_propagate(self):
+        pip = SubprocessPip()
+        rc, err = pip.main(['badcommand'])
+        assert rc != 0
+        # Don't want to depend on a particular error message from pip since it
+        # may change if we pin a differnet version to Chalice at some point.
+        # But there should be a non-empty error message of some kind.
+        assert err != b''
+
+
+class TestSdistMetadataFetcher(object):
+    _SETUPTOOLS = 'from setuptools import setup'
+    _DISTUTILS = 'from distutils.core import setup'
+    _BOTH = (
+        'try:\n'
+        '    from setuptools import setup\n'
+        'except ImportError:\n'
+        '    from distutils.core import setuptools\n'
+    )
+
+    _SETUP_PY = (
+        '%s\n'
+        'setup(\n'
+        '    name="%s",\n'
+        '    version="%s"\n'
+        ')\n'
+    )
+    _VALID_TAR_FORMATS = ['tar.gz', 'tar.bz2']
+
+    def _write_fake_sdist(self, setup_py, directory, ext):
+        filename = 'sdist.%s' % ext
+        path = '%s/%s' % (directory, filename)
+        if ext == 'zip':
+            with zipfile.ZipFile(path, 'w',
+                                 compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr('sdist/setup.py', setup_py)
+        elif ext in self._VALID_TAR_FORMATS:
+            compression_format = ext.split('.')[1]
+            with tarfile.open(path, 'w:%s' % compression_format) as tar:
+                tarinfo = tarfile.TarInfo('sdist/setup.py')
+                tarinfo.size = len(setup_py)
+                tar.addfile(tarinfo, io.BytesIO(setup_py.encode()))
+        else:
+            open(path, 'a').close()
+        filepath = os.path.join(directory, filename)
+        return filepath
+
+    def test_setup_tar_gz(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._SETUPTOOLS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.gz')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_setup_tar_bz2(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._SETUPTOOLS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.bz2')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_setup_tar_gz_hyphens_in_name(self, osutils, sdist_reader):
+        # The whole reason we need to use the egg info to get the name and
+        # version is that we cannot deterministically parse that information
+        # from the filenames themselves. This test puts hyphens in the name
+        # and version which would break a simple ``split("-")`` attempt to get
+        # that information.
+        setup_py = self._SETUP_PY % (
+            self._SETUPTOOLS, 'foo-bar', '1.0-2b'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.gz')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo-bar'
+        assert version == '1.0-2b'
+
+    def test_setup_zip(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._SETUPTOOLS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'zip')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_distutil_tar_gz(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._DISTUTILS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.gz')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_distutil_tar_bz2(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._DISTUTILS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.bz2')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_distutil_zip(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._DISTUTILS, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'zip')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_both_tar_gz(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._BOTH, 'foo-bar', '1.0-2b'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.gz')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo-bar'
+        assert version == '1.0-2b'
+
+    def test_both_tar_bz2(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._BOTH, 'foo-bar', '1.0-2b'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.bz2')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo-bar'
+        assert version == '1.0-2b'
+
+    def test_both_zip(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._BOTH, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'zip')
+            name, version = sdist_reader.get_package_name_and_version(
+                filepath)
+        assert name == 'foo'
+        assert version == '1.0'
+
+    def test_bad_format(self, osutils, sdist_reader):
+        setup_py = self._SETUP_PY % (
+            self._BOTH, 'foo', '1.0'
+        )
+        with osutils.tempdir() as tempdir:
+            filepath = self._write_fake_sdist(setup_py, tempdir, 'tar.gz2')
+            with pytest.raises(InvalidSourceDistributionNameError):
+                name, version = sdist_reader.get_package_name_and_version(
+                    filepath)
+
+
+class TestPackage(object):
+
+    def test_same_pkg_sdist_and_wheel_collide(self, osutils, sdist_builder):
+        with osutils.tempdir() as tempdir:
+            sdist_builder.write_fake_sdist(tempdir, 'foobar', '1.0')
+            pkgs = set()
+            pkgs.add(Package('', 'foobar-1.0-py3-none-any.whl'))
+            pkgs.add(Package(tempdir, 'foobar-1.0.zip'))
+            assert len(pkgs) == 1
+
+    def test_ensure_sdist_name_normalized_for_comparison(self, osutils,
+                                                         sdist_builder):
+        with osutils.tempdir() as tempdir:
+            sdist_builder.write_fake_sdist(tempdir, 'Foobar', '1.0')
+            pkgs = set()
+            pkgs.add(Package('', 'foobar-1.0-py3-none-any.whl'))
+            pkgs.add(Package(tempdir, 'Foobar-1.0.zip'))
+            assert len(pkgs) == 1
+
+    def test_ensure_wheel_name_normalized_for_comparison(self, osutils,
+                                                         sdist_builder):
+        with osutils.tempdir() as tempdir:
+            sdist_builder.write_fake_sdist(tempdir, 'foobar', '1.0')
+            pkgs = set()
+            pkgs.add(Package('', 'Foobar-1.0-py3-none-any.whl'))
+            pkgs.add(Package(tempdir, 'foobar-1.0.zip'))
+            assert len(pkgs) == 1

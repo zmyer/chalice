@@ -4,6 +4,7 @@ import json
 import importlib
 import logging
 
+from botocore.config import Config as BotocoreConfig
 from botocore.session import Session
 from typing import Any, Optional, Dict  # noqa
 
@@ -11,7 +12,6 @@ from chalice import __version__ as chalice_version
 from chalice.awsclient import TypedAWSClient
 from chalice.app import Chalice  # noqa
 from chalice.config import Config
-from chalice.deploy import deployer
 from chalice.package import create_app_packager
 from chalice.package import AppPackager  # noqa
 from chalice.constants import DEFAULT_STAGE_NAME
@@ -19,15 +19,20 @@ from chalice.constants import DEFAULT_APIGATEWAY_STAGE_NAME
 from chalice.logs import LogRetriever
 from chalice import local
 from chalice.utils import UI  # noqa
+from chalice.deploy import deployer  # noqa
 
 
-def create_botocore_session(profile=None, debug=False):
-    # type: (str, bool) -> Session
+def create_botocore_session(profile=None, debug=False,
+                            connection_timeout=None):
+    # type: (str, bool, int) -> Session
     s = Session(profile=profile)
     _add_chalice_user_agent(s)
     if debug:
         s.set_debug_logger('')
         _inject_large_request_body_filter()
+    if connection_timeout is not None:
+        config = BotocoreConfig(connect_timeout=connection_timeout)
+        s.set_default_client_config(config)
     return s
 
 
@@ -77,15 +82,24 @@ class CLIFactory(object):
         self.debug = debug
         self.profile = profile
 
-    def create_botocore_session(self):
-        # type: () -> Session
+    def create_botocore_session(self, connection_timeout=None):
+        # type: (int) -> Session
         return create_botocore_session(profile=self.profile,
-                                       debug=self.debug)
+                                       debug=self.debug,
+                                       connection_timeout=connection_timeout)
 
-    def create_default_deployer(self, session, ui):
+    def create_default_deployer(self, session, config, ui):
+        # type: (Session, Config, UI) -> deployer.Deployer
+        return deployer.create_default_deployer(session, config, ui)
+
+    def create_deletion_deployer(self, session, ui):
         # type: (Session, UI) -> deployer.Deployer
-        return deployer.create_default_deployer(
-            session=session, ui=ui)
+        return deployer.create_deletion_deployer(
+            TypedAWSClient(session), ui)
+
+    def create_deployment_reporter(self, ui):
+        # type: (UI) -> deployer.DeploymentReporter
+        return deployer.DeploymentReporter(ui=ui)
 
     def create_config_obj(self, chalice_stage_name=DEFAULT_STAGE_NAME,
                           autogen_policy=None,
@@ -186,6 +200,6 @@ class CLIFactory(object):
         with open(config_file) as f:
             return json.loads(f.read())
 
-    def create_local_server(self, app_obj, config, port):
-        # type: (Chalice, Config, int) -> local.LocalDevServer
-        return local.create_local_server(app_obj, config, port)
+    def create_local_server(self, app_obj, config, host, port):
+        # type: (Chalice, Config, str, int) -> local.LocalDevServer
+        return local.create_local_server(app_obj, config, host, port)

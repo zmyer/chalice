@@ -2,8 +2,10 @@ import re
 import json
 import decimal
 import pytest
+import mock
 from pytest import fixture
 from six import BytesIO
+from six.moves.BaseHTTPServer import HTTPServer
 
 from chalice import app
 from chalice import local, BadRequestError, CORSConfig
@@ -17,6 +19,7 @@ from chalice.local import LocalGatewayAuthorizer
 from chalice.local import NotAuthorizedError
 from chalice.local import ForbiddenError
 from chalice.local import InvalidAuthorizerError
+from chalice.local import LocalDevServer
 
 
 AWS_REQUEST_ID_PATTERN = re.compile(
@@ -482,10 +485,13 @@ def test_can_deny_unauthed_request(auth_handler):
 
 @pytest.mark.parametrize('actual_url,matched_url', [
     ('/foo', '/foo'),
+    ('/foo/', '/foo'),
     ('/foo/bar', '/foo/bar'),
     ('/foo/other', '/foo/{capture}'),
     ('/names/foo', '/names/{capture}'),
     ('/names/bar', '/names/{capture}'),
+    ('/names/bar/', '/names/{capture}'),
+    ('/names/', None),
     ('/nomatch', None),
     ('/names/bar/wrong', None),
     ('/a/z/c', '/a/{capture}/c'),
@@ -528,13 +534,39 @@ def test_can_create_lambda_event():
         'requestContext': {
             'httpMethod': 'GET',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
         },
         'headers': {'content-type': 'application/json'},
         'pathParameters': {'capture': 'other'},
-        'queryStringParameters': {},
+        'queryStringParameters': None,
+        'body': None,
+        'stageVariables': {},
+    }
+
+
+def test_parse_query_string():
+    converter = local.LambdaEventConverter(
+        local.RouteMatcher(['/foo/bar', '/foo/{capture}']))
+    event = converter.create_lambda_event(
+        method='GET',
+        path='/foo/other?a=1&b=&c=3',
+        headers={'content-type': 'application/json'}
+    )
+    assert event == {
+        'requestContext': {
+            'httpMethod': 'GET',
+            'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
+            'identity': {
+                'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
+            },
+        },
+        'headers': {'content-type': 'application/json'},
+        'pathParameters': {'capture': 'other'},
+        'queryStringParameters': {'a': '1', 'b': '', 'c': '3'},
         'body': None,
         'stageVariables': {},
     }
@@ -553,13 +585,14 @@ def test_can_create_lambda_event_for_put_request():
         'requestContext': {
             'httpMethod': 'PUT',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
         },
         'headers': {'content-type': 'application/json'},
         'pathParameters': {'capture': 'other'},
-        'queryStringParameters': {},
+        'queryStringParameters': None,
         'body': '{"foo": "bar"}',
         'stageVariables': {},
     }
@@ -579,21 +612,29 @@ def test_can_create_lambda_event_for_post_with_formencoded_body():
         'requestContext': {
             'httpMethod': 'POST',
             'resourcePath': '/foo/{capture}',
+            'path': '/foo/other',
             'identity': {
                 'sourceIp': local.LambdaEventConverter.LOCAL_SOURCE_IP
             },
         },
         'headers': {'content-type': 'application/x-www-form-urlencoded'},
         'pathParameters': {'capture': 'other'},
-        'queryStringParameters': {},
+        'queryStringParameters': None,
         'body': form_body,
         'stageVariables': {},
     }
 
 
 def test_can_provide_port_to_local_server(sample_app):
-    dev_server = local.create_local_server(sample_app, None, port=23456)
+    dev_server = local.create_local_server(sample_app, None, '127.0.0.1',
+                                           port=23456)
     assert dev_server.server.server_port == 23456
+
+
+def test_can_provide_host_to_local_server(sample_app):
+    dev_server = local.create_local_server(sample_app, None, host='0.0.0.0',
+                                           port=23456)
+    assert dev_server.host == '0.0.0.0'
 
 
 class TestLambdaContext(object):
@@ -664,7 +705,8 @@ class TestLocalGateway(object):
         assert body['name'] == 'api_handler'
         assert body['memory'] == 256
         assert body['version'] == '$LATEST'
-        assert body['timeout'] <= 10
+        assert body['timeout'] > 10
+        assert body['timeout'] <= 10000
         assert AWS_REQUEST_ID_PATTERN.match(body['request_id'])
 
     def test_can_validate_route_with_variables(self, demo_app_auth):
@@ -967,3 +1009,31 @@ def test_can_deny_multiple_resource_arns(arn, patterns):
     matcher = local.ARNMatcher(full_arn)
     does_match = matcher.does_any_resource_match(full_patterns)
     assert does_match is False
+
+
+class TestLocalDevServer(object):
+    def test_can_delegate_to_server(self, sample_app):
+        http_server = mock.Mock(spec=HTTPServer)
+        dev_server = LocalDevServer(
+            sample_app, Config(), '0.0.0.0', 8000,
+            server_cls=lambda *args: http_server,
+        )
+
+        dev_server.handle_single_request()
+        http_server.handle_request.assert_called_with()
+
+        dev_server.serve_forever()
+        http_server.serve_forever.assert_called_with()
+
+    def test_host_and_port_forwarded_to_server_creation(self):
+        provided_args = []
+
+        def args_recorder(*args):
+            provided_args[:] = list(args)
+
+        LocalDevServer(
+            sample_app, Config(), '0.0.0.0', 8000,
+            server_cls=args_recorder,
+        )
+
+        assert provided_args[0] == ('0.0.0.0', 8000)

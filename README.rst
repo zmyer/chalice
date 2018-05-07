@@ -173,11 +173,11 @@ function.  You can then redeploy your changes by running ``chalice deploy``.
 
 
 For the rest of these tutorials, we'll be using ``httpie`` instead of ``curl``
-(https://github.com/jkbrzt/httpie) to test our API.  You can install ``httpie``
-using ``pip install httpie``, or if you're on Mac, you can run ``brew install
-httpie``.  The Github link has more information on installation instructions.
-Here's an example of using ``httpie`` to request the root resource of the API
-we just created.  Note that the command name is ``http``::
+(https://github.com/jakubroztocil/httpie) to test our API.  You can install
+``httpie`` using ``pip install httpie``, or if you're on Mac, you can run
+``brew install httpie``.  The Github link has more information on installation
+instructions.  Here's an example of using ``httpie`` to request the root
+resource of the API we just created.  Note that the command name is ``http``::
 
 
     $ http https://qxea58oupc.execute-api.us-west-2.amazonaws.com/api/
@@ -378,6 +378,7 @@ There are a few additional exceptions you can raise from your python code::
 * ForbiddenError - return a status code of 403
 * NotFoundError - return a status code of 404
 * ConflictError - return a status code of 409
+* UnprocessableEntityError - return a status code of 422
 * TooManyRequestsError - return a status code of 429
 * ChaliceViewError - return a status code of 500
 
@@ -954,7 +955,6 @@ auto policy generator detects actions that it would like to add or remove::
 
     Would you like to continue?  [Y/n]:
 
-.. quick-start-end
 
 Tutorial: Using Custom Authentication
 =====================================
@@ -1097,6 +1097,7 @@ chalice stage to delete.  By default it will delete the ``dev`` stage::
     Delete the role helloworld-dev? [y/N]: y
     Deleting role name helloworld-dev
 
+.. quick-start-end
 
 Feedback
 ========
@@ -1147,3 +1148,6 @@ Related Projects
   on AWS Lambda and API Gateway.
 * `claudia <https://github.com/claudiajs/claudia>`__ - Deploy node.js projects
   to AWS Lambda and API Gateway.
+* `Domovoi <https://github.com/kislyuk/domovoi>`_ - An extension to Chalice that
+  handles a variety of AWS Lambda event sources such as SNS push notifications,
+  S3 events, and Step Functions state machines.

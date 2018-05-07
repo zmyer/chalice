@@ -17,7 +17,7 @@ function for something that's not supported by chalice or if you just want to
 create Lambda functions but don't want to manage handling dependencies and
 deployments yourself.
 
-In order to do this, you can use the :ref:`Chalice.lambda_function` decorator
+In order to do this, you can use the :meth:`Chalice.lambda_function` decorator
 to denote that this python function is a pure lambda function that should
 be invoked as is, without any input or output mapping.  When you use
 this function, you must provide a function that maps to the same function
@@ -52,10 +52,4 @@ You'll need to manage connecting them to any additional AWS Resources on your
 own.
 
 
-Limitations:
-
-* You must provide at least 1 ``@app.route`` decorator.  It is not
-  possible to deploy only lambda functions without an API Gateway API.
-
-
-.. _defined here: http://docs.aws.amazon.com/lambda/latest/dg/python-programming-model-handler-types.html
+.. _defined here: https://docs.aws.amazon.com/lambda/latest/dg/python-programming-model-handler-types.html
